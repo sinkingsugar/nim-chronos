@@ -196,13 +196,16 @@ template shiftVectorFile(v, o: untyped) =
   (v).buf = cast[pointer](cast[uint]((v).buf) - cast[uint](o))
   (v).offset += cast[uint]((o))
 
-proc setupStreamTransportTracker(): StreamTransportTracker {.gcsafe.}
+proc setupStreamTransportTracker(): StreamTransportTracker {.gcsafe, raises: [Defect].}
 proc setupStreamServerTracker(): StreamServerTracker {.gcsafe.}
 
-proc getStreamTransportTracker(): StreamTransportTracker {.inline.} =
-  result = cast[StreamTransportTracker](getTracker(StreamTransportTrackerName))
-  if isNil(result):
-    result = setupStreamTransportTracker()
+proc getStreamTransportTracker(): StreamTransportTracker {.inline, raises: [Defect].} =
+  try:
+    result = cast[StreamTransportTracker](getTracker(StreamTransportTrackerName))
+    if isNil(result):
+      result = setupStreamTransportTracker()
+  except OSError:
+    discard # FIXME WIP
 
 proc getStreamServerTracker(): StreamServerTracker {.inline.} =
   result = cast[StreamServerTracker](getTracker(StreamServerTrackerName))
@@ -243,13 +246,16 @@ proc untrackServer(s: StreamServer) {.inline.}  =
   var tracker = getStreamServerTracker()
   inc(tracker.closed)
 
-proc setupStreamTransportTracker(): StreamTransportTracker {.gcsafe.} =
-  result = new StreamTransportTracker
-  result.opened = 0
-  result.closed = 0
-  result.dump = dumpTransportTracking
-  result.isLeaked = leakTransport
-  addTracker(StreamTransportTrackerName, result)
+proc setupStreamTransportTracker(): StreamTransportTracker {.gcsafe, raises: [Defect].} =
+  try:
+    result = new StreamTransportTracker
+    result.opened = 0
+    result.closed = 0
+    result.dump = dumpTransportTracking
+    result.isLeaked = leakTransport
+    addTracker(StreamTransportTrackerName, result)
+  except OSError:
+    discard # FIXME WIP
 
 proc setupStreamServerTracker(): StreamServerTracker {.gcsafe.} =
   result = new StreamServerTracker
@@ -267,7 +273,7 @@ proc completePendingWriteQueue(queue: var Deque[StreamVector],
       vector.writer.complete(v)
 
 proc failPendingWriteQueue(queue: var Deque[StreamVector],
-                           error: ref Exception) {.inline.} =
+                           error: ref CatchableError) {.inline.} =
   while len(queue) > 0:
     var vector = queue.popFirst()
     if not(vector.writer.finished()):
@@ -303,312 +309,322 @@ when defined(windows):
              (err == OSErrorCode(WSAECONNABORTED)) or
              (err == OSErrorCode(ERROR_PIPE_NOT_CONNECTED))
 
-  proc writeStreamLoop(udata: pointer) {.gcsafe, nimcall.} =
-    var bytesCount: int32
-    var ovl = cast[PtrCustomOverlapped](udata)
-    var transp = cast[StreamTransport](ovl.data.udata)
+  proc writeStreamLoop(udata: pointer) {.gcsafe, nimcall, raises: [Defect].} =
+    try:
+      var bytesCount: int32
+      var ovl = cast[PtrCustomOverlapped](udata)
+      var transp = cast[StreamTransport](ovl.data.udata)
 
-    while len(transp.queue) > 0:
-      if WritePending in transp.state:
-        ## Continuation
-        transp.state.excl(WritePending)
-        let err = transp.wovl.data.errCode
-        if err == OSErrorCode(-1):
-          bytesCount = transp.wovl.data.bytesCount
-          var vector = transp.queue.popFirst()
-          if bytesCount == 0:
-            if not(vector.writer.finished()):
-              vector.writer.complete(0)
-          else:
-            if transp.kind == TransportKind.Socket:
-              if vector.kind == VectorKind.DataBuffer:
-                if bytesCount < transp.wwsabuf.len:
-                  vector.shiftVectorBuffer(bytesCount)
-                  transp.queue.addFirst(vector)
+      while len(transp.queue) > 0:
+        if WritePending in transp.state:
+          ## Continuation
+          transp.state.excl(WritePending)
+          let err = transp.wovl.data.errCode
+          if err == OSErrorCode(-1):
+            bytesCount = transp.wovl.data.bytesCount
+            var vector = transp.queue.popFirst()
+            if bytesCount == 0:
+              if not(vector.writer.finished()):
+                vector.writer.complete(0)
+            else:
+              if transp.kind == TransportKind.Socket:
+                if vector.kind == VectorKind.DataBuffer:
+                  if bytesCount < transp.wwsabuf.len:
+                    vector.shiftVectorBuffer(bytesCount)
+                    transp.queue.addFirst(vector)
+                  else:
+                    if not(vector.writer.finished()):
+                      vector.writer.complete(transp.wwsabuf.len)
                 else:
-                  if not(vector.writer.finished()):
-                    vector.writer.complete(transp.wwsabuf.len)
-              else:
-                if uint(bytesCount) < getFileSize(vector):
-                  vector.shiftVectorFile(bytesCount)
-                  transp.queue.addFirst(vector)
-                else:
-                  if not(vector.writer.finished()):
-                    vector.writer.complete(int(getFileSize(vector)))
-            elif transp.kind == TransportKind.Pipe:
-              if vector.kind == VectorKind.DataBuffer:
-                if bytesCount < transp.wwsabuf.len:
-                  vector.shiftVectorBuffer(bytesCount)
-                  transp.queue.addFirst(vector)
-                else:
-                  if not(vector.writer.finished()):
-                    vector.writer.complete(transp.wwsabuf.len)
-        elif int(err) == ERROR_OPERATION_ABORTED:
-          # CancelIO() interrupt
-          transp.state.incl({WritePaused, WriteEof})
-          let vector = transp.queue.popFirst()
-          if not(vector.writer.finished()):
-            vector.writer.complete(0)
-          completePendingWriteQueue(transp.queue, 0)
-          break
-        else:
-          let vector = transp.queue.popFirst()
-          if isConnResetError(err):
-            # Soft error happens which indicates that remote peer got
-            # disconnected, complete all pending writes in queue with 0.
+                  if uint(bytesCount) < getFileSize(vector):
+                    vector.shiftVectorFile(bytesCount)
+                    transp.queue.addFirst(vector)
+                  else:
+                    if not(vector.writer.finished()):
+                      vector.writer.complete(int(getFileSize(vector)))
+              elif transp.kind == TransportKind.Pipe:
+                if vector.kind == VectorKind.DataBuffer:
+                  if bytesCount < transp.wwsabuf.len:
+                    vector.shiftVectorBuffer(bytesCount)
+                    transp.queue.addFirst(vector)
+                  else:
+                    if not(vector.writer.finished()):
+                      vector.writer.complete(transp.wwsabuf.len)
+          elif int(err) == ERROR_OPERATION_ABORTED:
+            # CancelIO() interrupt
             transp.state.incl({WritePaused, WriteEof})
+            let vector = transp.queue.popFirst()
             if not(vector.writer.finished()):
               vector.writer.complete(0)
             completePendingWriteQueue(transp.queue, 0)
             break
           else:
-            transp.state.incl({WritePaused, WriteError})
-            let error = getTransportOsError(err)
-            if not(vector.writer.finished()):
-              vector.writer.fail(error)
-            failPendingWriteQueue(transp.queue, error)
-            break
-      else:
-        ## Initiation
-        transp.state.incl(WritePending)
-        if transp.kind == TransportKind.Socket:
-          let sock = SocketHandle(transp.wovl.data.fd)
-          var vector = transp.queue.popFirst()
-          if vector.kind == VectorKind.DataBuffer:
-            transp.wovl.zeroOvelappedOffset()
-            transp.setWriterWSABuffer(vector)
-            let ret = WSASend(sock, addr transp.wwsabuf, 1,
-                              addr bytesCount, DWORD(0),
-                              cast[POVERLAPPED](addr transp.wovl), nil)
-            if ret != 0:
-              let err = osLastError()
-              if int(err) == ERROR_OPERATION_ABORTED:
-                # CancelIO() interrupt
-                transp.state.excl(WritePending)
-                transp.state.incl({WritePaused, WriteEof})
-                if not(vector.writer.finished()):
-                  vector.writer.complete(0)
-                completePendingWriteQueue(transp.queue, 0)
-                break
-              elif int(err) == ERROR_IO_PENDING:
-                transp.queue.addFirst(vector)
-              else:
-                transp.state.excl(WritePending)
-                if isConnResetError(err):
-                  # Soft error happens which indicates that remote peer got
-                  # disconnected, complete all pending writes in queue with 0.
+            let vector = transp.queue.popFirst()
+            if isConnResetError(err):
+              # Soft error happens which indicates that remote peer got
+              # disconnected, complete all pending writes in queue with 0.
+              transp.state.incl({WritePaused, WriteEof})
+              if not(vector.writer.finished()):
+                vector.writer.complete(0)
+              completePendingWriteQueue(transp.queue, 0)
+              break
+            else:
+              transp.state.incl({WritePaused, WriteError})
+              let error = getTransportOsError(err)
+              if not(vector.writer.finished()):
+                vector.writer.fail(error)
+              failPendingWriteQueue(transp.queue, error)
+              break
+        else:
+          ## Initiation
+          transp.state.incl(WritePending)
+          if transp.kind == TransportKind.Socket:
+            let sock = SocketHandle(transp.wovl.data.fd)
+            var vector = transp.queue.popFirst()
+            if vector.kind == VectorKind.DataBuffer:
+              transp.wovl.zeroOvelappedOffset()
+              transp.setWriterWSABuffer(vector)
+              let ret = WSASend(sock, addr transp.wwsabuf, 1,
+                                addr bytesCount, DWORD(0),
+                                cast[POVERLAPPED](addr transp.wovl), nil)
+              if ret != 0:
+                let err = osLastError()
+                if int(err) == ERROR_OPERATION_ABORTED:
+                  # CancelIO() interrupt
+                  transp.state.excl(WritePending)
                   transp.state.incl({WritePaused, WriteEof})
                   if not(vector.writer.finished()):
                     vector.writer.complete(0)
                   completePendingWriteQueue(transp.queue, 0)
                   break
+                elif int(err) == ERROR_IO_PENDING:
+                  transp.queue.addFirst(vector)
                 else:
-                  transp.state.incl({WritePaused, WriteError})
-                  let error = getTransportOsError(err)
-                  if not(vector.writer.finished()):
-                    vector.writer.fail(error)
-                  failPendingWriteQueue(transp.queue, error)
-                  break
-            else:
-              transp.queue.addFirst(vector)
-          else:
-            let loop = getGlobalDispatcher()
-            var size: int32
-            var flags: int32
-
-            if getFileSize(vector) > 2_147_483_646'u:
-              size = 2_147_483_646
-            else:
-              size = int32(getFileSize(vector))
-
-            transp.wovl.setOverlappedOffset(vector.offset)
-            var ret = loop.transmitFile(sock, getFileHandle(vector), size, 0,
-                                        cast[POVERLAPPED](addr transp.wovl),
-                                        nil, flags)
-            if ret == 0:
-              let err = osLastError()
-              if int(err) == ERROR_OPERATION_ABORTED:
-                # CancelIO() interrupt
-                transp.state.excl(WritePending)
-                transp.state.incl({WritePaused, WriteEof})
-                if not(vector.writer.finished()):
-                  vector.writer.complete(0)
-                completePendingWriteQueue(transp.queue, 0)
-                break
-              elif int(err) == ERROR_IO_PENDING:
-                transp.queue.addFirst(vector)
+                  transp.state.excl(WritePending)
+                  if isConnResetError(err):
+                    # Soft error happens which indicates that remote peer got
+                    # disconnected, complete all pending writes in queue with 0.
+                    transp.state.incl({WritePaused, WriteEof})
+                    if not(vector.writer.finished()):
+                      vector.writer.complete(0)
+                    completePendingWriteQueue(transp.queue, 0)
+                    break
+                  else:
+                    transp.state.incl({WritePaused, WriteError})
+                    let error = getTransportOsError(err)
+                    if not(vector.writer.finished()):
+                      vector.writer.fail(error)
+                    failPendingWriteQueue(transp.queue, error)
+                    break
               else:
-                transp.state.excl(WritePending)
-                if isConnResetError(err):
-                  # Soft error happens which indicates that remote peer got
-                  # disconnected, complete all pending writes in queue with 0.
+                transp.queue.addFirst(vector)
+            else:
+              let loop = getGlobalDispatcher()
+              var size: int32
+              var flags: int32
+
+              if getFileSize(vector) > 2_147_483_646'u:
+                size = 2_147_483_646
+              else:
+                size = int32(getFileSize(vector))
+
+              transp.wovl.setOverlappedOffset(vector.offset)
+              var ret = 0
+              try:
+                ret = loop.transmitFile(sock, getFileHandle(vector), size, 0,
+                                          cast[POVERLAPPED](addr transp.wovl),
+                                          nil, flags)
+              except Exception:
+                discard #FIXME WIP
+              if ret == 0:
+                let err = osLastError()
+                if int(err) == ERROR_OPERATION_ABORTED:
+                  # CancelIO() interrupt
+                  transp.state.excl(WritePending)
                   transp.state.incl({WritePaused, WriteEof})
                   if not(vector.writer.finished()):
                     vector.writer.complete(0)
                   completePendingWriteQueue(transp.queue, 0)
                   break
+                elif int(err) == ERROR_IO_PENDING:
+                  transp.queue.addFirst(vector)
                 else:
-                  transp.state.incl({WritePaused, WriteError})
-                  let error = getTransportOsError(err)
-                  if not(vector.writer.finished()):
-                    vector.writer.fail(error)
-                  failPendingWriteQueue(transp.queue, error)
-                  break
-            else:
-              transp.queue.addFirst(vector)
-        elif transp.kind == TransportKind.Pipe:
-          let pipe = Handle(transp.wovl.data.fd)
-          var vector = transp.queue.popFirst()
-          if vector.kind == VectorKind.DataBuffer:
-            transp.wovl.zeroOvelappedOffset()
-            transp.setWriterWSABuffer(vector)
-            let ret = writeFile(pipe, cast[pointer](transp.wwsabuf.buf),
-                                DWORD(transp.wwsabuf.len), addr bytesCount,
-                                cast[POVERLAPPED](addr transp.wovl))
-            if ret == 0:
-              let err = osLastError()
-              if int(err) in {ERROR_OPERATION_ABORTED, ERROR_NO_DATA}:
-                # CancelIO() interrupt
-                transp.state.excl(WritePending)
-                transp.state.incl({WritePaused, WriteEof})
-                if not(vector.writer.finished()):
-                  vector.writer.complete(0)
-                completePendingWriteQueue(transp.queue, 0)
-                break
-              elif int(err) == ERROR_IO_PENDING:
-                transp.queue.addFirst(vector)
+                  transp.state.excl(WritePending)
+                  if isConnResetError(err):
+                    # Soft error happens which indicates that remote peer got
+                    # disconnected, complete all pending writes in queue with 0.
+                    transp.state.incl({WritePaused, WriteEof})
+                    if not(vector.writer.finished()):
+                      vector.writer.complete(0)
+                    completePendingWriteQueue(transp.queue, 0)
+                    break
+                  else:
+                    transp.state.incl({WritePaused, WriteError})
+                    let error = getTransportOsError(err)
+                    if not(vector.writer.finished()):
+                      vector.writer.fail(error)
+                    failPendingWriteQueue(transp.queue, error)
+                    break
               else:
-                transp.state.excl(WritePending)
-                if isConnResetError(err):
-                  # Soft error happens which indicates that remote peer got
-                  # disconnected, complete all pending writes in queue with 0.
+                transp.queue.addFirst(vector)
+          elif transp.kind == TransportKind.Pipe:
+            let pipe = Handle(transp.wovl.data.fd)
+            var vector = transp.queue.popFirst()
+            if vector.kind == VectorKind.DataBuffer:
+              transp.wovl.zeroOvelappedOffset()
+              transp.setWriterWSABuffer(vector)
+              let ret = writeFile(pipe, cast[pointer](transp.wwsabuf.buf),
+                                  DWORD(transp.wwsabuf.len), addr bytesCount,
+                                  cast[POVERLAPPED](addr transp.wovl))
+              if ret == 0:
+                let err = osLastError()
+                if int(err) in {ERROR_OPERATION_ABORTED, ERROR_NO_DATA}:
+                  # CancelIO() interrupt
+                  transp.state.excl(WritePending)
                   transp.state.incl({WritePaused, WriteEof})
                   if not(vector.writer.finished()):
                     vector.writer.complete(0)
                   completePendingWriteQueue(transp.queue, 0)
                   break
+                elif int(err) == ERROR_IO_PENDING:
+                  transp.queue.addFirst(vector)
                 else:
-                  transp.state.incl({WritePaused, WriteError})
-                  let error = getTransportOsError(err)
-                  if not(vector.writer.finished()):
-                    vector.writer.fail(error)
-                  failPendingWriteQueue(transp.queue, error)
-                  break
+                  transp.state.excl(WritePending)
+                  if isConnResetError(err):
+                    # Soft error happens which indicates that remote peer got
+                    # disconnected, complete all pending writes in queue with 0.
+                    transp.state.incl({WritePaused, WriteEof})
+                    if not(vector.writer.finished()):
+                      vector.writer.complete(0)
+                    completePendingWriteQueue(transp.queue, 0)
+                    break
+                  else:
+                    transp.state.incl({WritePaused, WriteError})
+                    let error = getTransportOsError(err)
+                    if not(vector.writer.finished()):
+                      vector.writer.fail(error)
+                    failPendingWriteQueue(transp.queue, error)
+                    break
+              else:
+                transp.queue.addFirst(vector)
+          break
+
+      if len(transp.queue) == 0:
+        transp.state.incl(WritePaused)
+    except OSError:
+      discard # FIXME WIP
+
+  proc readStreamLoop(udata: pointer) {.gcsafe, nimcall, raises: [Defect].} =
+    try:
+      var ovl = cast[PtrCustomOverlapped](udata)
+      var transp = cast[StreamTransport](ovl.data.udata)
+      while true:
+        if ReadPending in transp.state:
+          ## Continuation
+          transp.state.excl(ReadPending)
+          let err = transp.rovl.data.errCode
+          if err == OSErrorCode(-1):
+            let bytesCount = transp.rovl.data.bytesCount
+            if bytesCount == 0:
+              transp.state.incl({ReadEof, ReadPaused})
             else:
-              transp.queue.addFirst(vector)
-        break
-
-    if len(transp.queue) == 0:
-      transp.state.incl(WritePaused)
-
-  proc readStreamLoop(udata: pointer) {.gcsafe, nimcall.} =
-    var ovl = cast[PtrCustomOverlapped](udata)
-    var transp = cast[StreamTransport](ovl.data.udata)
-    while true:
-      if ReadPending in transp.state:
-        ## Continuation
-        transp.state.excl(ReadPending)
-        let err = transp.rovl.data.errCode
-        if err == OSErrorCode(-1):
-          let bytesCount = transp.rovl.data.bytesCount
-          if bytesCount == 0:
+              if transp.offset != transp.roffset:
+                moveMem(addr transp.buffer[transp.offset],
+                        addr transp.buffer[transp.roffset],
+                        bytesCount)
+              transp.offset += bytesCount
+              transp.roffset = transp.offset
+              if transp.offset == len(transp.buffer):
+                transp.state.incl(ReadPaused)
+          elif int(err) in {ERROR_OPERATION_ABORTED, ERROR_CONNECTION_ABORTED,
+                            ERROR_BROKEN_PIPE, ERROR_NETNAME_DELETED}:
+            # CancelIO() interrupt or closeSocket() call.
+            transp.state.incl(ReadPaused)
+          elif transp.kind == TransportKind.Socket and
+               (int(err) in {ERROR_NETNAME_DELETED, WSAECONNABORTED}):
+            transp.state.incl({ReadEof, ReadPaused})
+          elif transp.kind == TransportKind.Pipe and
+               (int(err) in {ERROR_PIPE_NOT_CONNECTED}):
             transp.state.incl({ReadEof, ReadPaused})
           else:
-            if transp.offset != transp.roffset:
-              moveMem(addr transp.buffer[transp.offset],
-                      addr transp.buffer[transp.roffset],
-                      bytesCount)
-            transp.offset += bytesCount
-            transp.roffset = transp.offset
-            if transp.offset == len(transp.buffer):
-              transp.state.incl(ReadPaused)
-        elif int(err) in {ERROR_OPERATION_ABORTED, ERROR_CONNECTION_ABORTED,
-                          ERROR_BROKEN_PIPE, ERROR_NETNAME_DELETED}:
-          # CancelIO() interrupt or closeSocket() call.
-          transp.state.incl(ReadPaused)
-        elif transp.kind == TransportKind.Socket and
-             (int(err) in {ERROR_NETNAME_DELETED, WSAECONNABORTED}):
-          transp.state.incl({ReadEof, ReadPaused})
-        elif transp.kind == TransportKind.Pipe and
-             (int(err) in {ERROR_PIPE_NOT_CONNECTED}):
-          transp.state.incl({ReadEof, ReadPaused})
-        else:
-          transp.setReadError(err)
+            transp.setReadError(err)
 
-        transp.completeReader()
-
-        if ReadClosed in transp.state:
-          # Stop tracking transport
-          untrackStream(transp)
-          # If `ReadClosed` present, then close(transport) was called.
-          if not(transp.future.finished()):
-            transp.future.complete()
-          GC_unref(transp)
-
-        if ReadPaused in transp.state:
-          # Transport buffer is full, so we will not continue on reading.
-          break
-      else:
-        ## Initiation
-        if transp.state * {ReadEof, ReadClosed, ReadError} == {}:
-          var flags = DWORD(0)
-          var bytesCount: int32 = 0
-          transp.state.excl(ReadPaused)
-          transp.state.incl(ReadPending)
-          if transp.kind == TransportKind.Socket:
-            let sock = SocketHandle(transp.rovl.data.fd)
-            transp.roffset = transp.offset
-            transp.setReaderWSABuffer()
-            let ret = WSARecv(sock, addr transp.rwsabuf, 1,
-                              addr bytesCount, addr flags,
-                              cast[POVERLAPPED](addr transp.rovl), nil)
-            if ret != 0:
-              let err = osLastError()
-              if int32(err) == ERROR_OPERATION_ABORTED:
-                # CancelIO() interrupt
-                transp.state.excl(ReadPending)
-                transp.state.incl(ReadPaused)
-              elif int32(err) in {WSAECONNRESET, WSAENETRESET, WSAECONNABORTED}:
-                transp.state.excl(ReadPending)
-                transp.state.incl({ReadEof, ReadPaused})
-                transp.completeReader()
-              elif int32(err) != ERROR_IO_PENDING:
-                transp.state.excl(ReadPending)
-                transp.state.incl(ReadPaused)
-                transp.setReadError(err)
-                transp.completeReader()
-          elif transp.kind == TransportKind.Pipe:
-            let pipe = Handle(transp.rovl.data.fd)
-            transp.roffset = transp.offset
-            transp.setReaderWSABuffer()
-            let ret = readFile(pipe, cast[pointer](transp.rwsabuf.buf),
-                               DWORD(transp.rwsabuf.len), addr bytesCount,
-                               cast[POVERLAPPED](addr transp.rovl))
-            if ret == 0:
-              let err = osLastError()
-              if int32(err) == ERROR_OPERATION_ABORTED:
-                # CancelIO() interrupt
-                transp.state.excl(ReadPending)
-                transp.state.incl(ReadPaused)
-              elif int32(err) in {ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED}:
-                transp.state.excl(ReadPending)
-                transp.state.incl({ReadEof, ReadPaused})
-                transp.completeReader()
-              elif int32(err) != ERROR_IO_PENDING:
-                transp.state.excl(ReadPending)
-                transp.state.incl(ReadPaused)
-                transp.setReadError(err)
-                transp.completeReader()
-        else:
-          transp.state.incl(ReadPaused)
           transp.completeReader()
-          # Transport close happens in callback, and we not started new
-          # WSARecvFrom session.
+
           if ReadClosed in transp.state:
+            # Stop tracking transport
+            untrackStream(transp)
+            # If `ReadClosed` present, then close(transport) was called.
             if not(transp.future.finished()):
               transp.future.complete()
-        ## Finish Loop
-        break
+            GC_unref(transp)
+
+          if ReadPaused in transp.state:
+            # Transport buffer is full, so we will not continue on reading.
+            break
+        else:
+          ## Initiation
+          if transp.state * {ReadEof, ReadClosed, ReadError} == {}:
+            var flags = DWORD(0)
+            var bytesCount: int32 = 0
+            transp.state.excl(ReadPaused)
+            transp.state.incl(ReadPending)
+            if transp.kind == TransportKind.Socket:
+              let sock = SocketHandle(transp.rovl.data.fd)
+              transp.roffset = transp.offset
+              transp.setReaderWSABuffer()
+              let ret = WSARecv(sock, addr transp.rwsabuf, 1,
+                                addr bytesCount, addr flags,
+                                cast[POVERLAPPED](addr transp.rovl), nil)
+              if ret != 0:
+                let err = osLastError()
+                if int32(err) == ERROR_OPERATION_ABORTED:
+                  # CancelIO() interrupt
+                  transp.state.excl(ReadPending)
+                  transp.state.incl(ReadPaused)
+                elif int32(err) in {WSAECONNRESET, WSAENETRESET, WSAECONNABORTED}:
+                  transp.state.excl(ReadPending)
+                  transp.state.incl({ReadEof, ReadPaused})
+                  transp.completeReader()
+                elif int32(err) != ERROR_IO_PENDING:
+                  transp.state.excl(ReadPending)
+                  transp.state.incl(ReadPaused)
+                  transp.setReadError(err)
+                  transp.completeReader()
+            elif transp.kind == TransportKind.Pipe:
+              let pipe = Handle(transp.rovl.data.fd)
+              transp.roffset = transp.offset
+              transp.setReaderWSABuffer()
+              let ret = readFile(pipe, cast[pointer](transp.rwsabuf.buf),
+                                 DWORD(transp.rwsabuf.len), addr bytesCount,
+                                 cast[POVERLAPPED](addr transp.rovl))
+              if ret == 0:
+                let err = osLastError()
+                if int32(err) == ERROR_OPERATION_ABORTED:
+                  # CancelIO() interrupt
+                  transp.state.excl(ReadPending)
+                  transp.state.incl(ReadPaused)
+                elif int32(err) in {ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED}:
+                  transp.state.excl(ReadPending)
+                  transp.state.incl({ReadEof, ReadPaused})
+                  transp.completeReader()
+                elif int32(err) != ERROR_IO_PENDING:
+                  transp.state.excl(ReadPending)
+                  transp.state.incl(ReadPaused)
+                  transp.setReadError(err)
+                  transp.completeReader()
+          else:
+            transp.state.incl(ReadPaused)
+            transp.completeReader()
+            # Transport close happens in callback, and we not started new
+            # WSARecvFrom session.
+            if ReadClosed in transp.state:
+              if not(transp.future.finished()):
+                transp.future.complete()
+          ## Finish Loop
+          break
+    except OSError:
+      discard # FIXME WIP
 
   proc newStreamSocketTransport(sock: AsyncFD, bufsize: int,
                                 child: StreamTransport): StreamTransport =
@@ -700,29 +716,35 @@ when defined(windows):
         retFuture.fail(getTransportOsError(err))
         return retFuture
 
-      proc socketContinuation(udata: pointer) {.gcsafe.} =
-        var ovl = cast[RefCustomOverlapped](udata)
-        if not(retFuture.finished()):
-          if ovl.data.errCode == OSErrorCode(-1):
-            if setsockopt(SocketHandle(sock), cint(SOL_SOCKET),
-                          cint(SO_UPDATE_CONNECT_CONTEXT), nil,
-                          SockLen(0)) != 0'i32:
-              let err = wsaGetLastError()
-              sock.closeSocket()
-              retFuture.fail(getTransportOsError(err))
+      proc socketContinuation(udata: pointer) {.gcsafe, raises: [Defect].} =
+        try:
+          var ovl = cast[RefCustomOverlapped](udata)
+          if not(retFuture.finished()):
+            if ovl.data.errCode == OSErrorCode(-1):
+              if setsockopt(SocketHandle(sock), cint(SOL_SOCKET),
+                            cint(SO_UPDATE_CONNECT_CONTEXT), nil,
+                            SockLen(0)) != 0'i32:
+                let err = wsaGetLastError()
+                sock.closeSocket()
+                retFuture.fail(getTransportOsError(err))
+              else:
+                let transp = newStreamSocketTransport(povl.data.fd, bufferSize,
+                                                      child)
+                # Start tracking transport
+                trackStream(transp)
+                retFuture.complete(transp)
             else:
-              let transp = newStreamSocketTransport(povl.data.fd, bufferSize,
-                                                    child)
-              # Start tracking transport
-              trackStream(transp)
-              retFuture.complete(transp)
-          else:
-            sock.closeSocket()
-            retFuture.fail(getTransportOsError(ovl.data.errCode))
-        GC_unref(ovl)
+              sock.closeSocket()
+              retFuture.fail(getTransportOsError(ovl.data.errCode))
+          GC_unref(ovl)
+        except OSError:
+          discard # FIXME WIP
 
-      proc cancel(udata: pointer) {.gcsafe.} =
-        sock.closeSocket()
+      proc cancel(udata: pointer) {.gcsafe, raises: [Defect].} =
+        try:
+          sock.closeSocket()
+        except OSError:
+          discard # FIXME WIP
 
       povl = RefCustomOverlapped()
       GC_ref(povl)
@@ -743,13 +765,20 @@ when defined(windows):
 
     elif address.family == AddressFamily.Unix:
       ## Unix domain socket emulation with Windows Named Pipes.
-      var pipeHandle = INVALID_HANDLE_VALUE
-      proc pipeContinuation(udata: pointer) {.gcsafe.} =
+      proc pipeContinuation(udata: pointer) {.gcsafe, raises: [Defect, OSError].}
+      proc workAround(udata: pointer) {.gcsafe, raises: [Defect].} =
+        # Nim won't like pipeContinuation directly used in the following
+        # setTimer call
+        try:
+          pipeContinuation(nil)
+        except OSError:
+          discard # FIXME WIP
+      proc pipeContinuation(udata: pointer) {.gcsafe, raises: [Defect, OSError].} =
         # Continue only if `retFuture` is not cancelled.
         if not(retFuture.finished()):
           var pipeSuffix = $cast[cstring](unsafeAddr address.address_un[0])
           var pipeName = newWideCString(r"\\.\pipe\" & pipeSuffix[1 .. ^1])
-          pipeHandle = createFileW(pipeName, GENERIC_READ or GENERIC_WRITE,
+          var pipeHandle = createFileW(pipeName, GENERIC_READ or GENERIC_WRITE,
                                    FILE_SHARE_READ or FILE_SHARE_WRITE,
                                    nil, OPEN_EXISTING,
                                    FILE_FLAG_OVERLAPPED, Handle(0))
@@ -757,7 +786,7 @@ when defined(windows):
             let err = osLastError()
             if int32(err) == ERROR_PIPE_BUSY:
               discard setTimer(Moment.fromNow(50.milliseconds),
-                               pipeContinuation, nil)
+                               workAround, nil)
             else:
               retFuture.fail(getTransportOsError(err))
           else:
@@ -858,7 +887,7 @@ when defined(windows):
 
               GC_unref(server)
 
-  proc acceptLoop(udata: pointer) {.gcsafe, nimcall.} =
+  proc acceptLoop(udata: pointer) {.gcsafe, nimcall, raises: [Defect].} =
     var ovl = cast[PtrCustomOverlapped](udata)
     var server = cast[StreamServer](ovl.data.udata)
     var loop = getGlobalDispatcher()
@@ -1360,14 +1389,17 @@ proc close*(server: StreamServer) =
   ##
   ## Please note that release of resources is not completed immediately, to be
   ## sure all resources got released please use ``await server.join()``.
-  proc continuation(udata: pointer) {.gcsafe.} =
+  proc continuation(udata: pointer) {.gcsafe, raises: [Defect].} =
     # Stop tracking server
-    if not(server.loopFuture.finished()):
-      untrackServer(server)
-      server.loopFuture.complete()
-      if not isNil(server.udata) and GCUserData in server.flags:
-        GC_unref(cast[ref int](server.udata))
-      GC_unref(server)
+    try:
+      if not(server.loopFuture.finished()):
+        untrackServer(server)
+        server.loopFuture.complete()
+        if not isNil(server.udata) and GCUserData in server.flags:
+          GC_unref(cast[ref int](server.udata))
+        GC_unref(server)
+    except Exception:
+      discard # FIXME WIP
 
   if server.status == ServerStatus.Stopped:
     server.status = ServerStatus.Closed

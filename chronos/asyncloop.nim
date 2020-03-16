@@ -177,7 +177,7 @@ elif unixPlatform:
                     MSG_NOSIGNAL, SIGPIPE
 
 type
-  CallbackFunc* = proc (arg: pointer = nil) {.gcsafe.}
+  CallbackFunc* = proc (arg: pointer = nil) {.gcsafe, raises: [Defect].}
   CallSoonProc* = proc (c: CallbackFunc, u: pointer = nil) {.gcsafe.}
 
   AsyncCallback* = object
@@ -208,7 +208,7 @@ type
 proc `<`(a, b: TimerCallback): bool =
   result = a.finishAt < b.finishAt
 
-proc callSoon*(cbproc: CallbackFunc, data: pointer = nil) {.gcsafe.}
+proc callSoon*(cbproc: CallbackFunc, data: pointer = nil) {.gcsafe, raises: [Defect].}
 
 func getAsyncTimestamp*(a: Duration): auto {.inline.} =
   ## Return rounded up value of duration with milliseconds resolution.
@@ -790,10 +790,10 @@ proc sleepAsync*(duration: Duration): Future[void] =
   let moment = Moment.fromNow(duration)
   var timer: TimerCallback
 
-  proc completion(data: pointer) {.gcsafe.} =
+  proc completion(data: pointer) {.gcsafe, raises: [Defect].} =
     retFuture.complete()
 
-  proc cancellation(udata: pointer) {.gcsafe.} =
+  proc cancellation(udata: pointer) {.gcsafe, raises: [].} =
     clearTimer(timer)
 
   retFuture.cancelCallback = cancellation
@@ -928,12 +928,15 @@ proc wait*[T](fut: Future[T], timeout = -1): Future[T] {.
 
 include asyncmacro2
 
-proc callSoon*(cbproc: CallbackFunc, data: pointer = nil) =
+proc callSoon*(cbproc: CallbackFunc, data: pointer = nil) {.raises: [Defect].} =
   ## Schedule `cbproc` to be called as soon as possible.
   ## The callback is called when control returns to the event loop.
-  doAssert(not isNil(cbproc))
-  let acb = AsyncCallback(function: cbproc, udata: data)
-  getGlobalDispatcher().callbacks.addLast(acb)
+  try:
+    doAssert(not isNil(cbproc))
+    let acb = AsyncCallback(function: cbproc, udata: data)
+    getGlobalDispatcher().callbacks.addLast(acb)
+  except OSError:
+    discard # FIXME WIP
 
 proc runForever*() =
   ## Begins a never ending global dispatcher poll loop.

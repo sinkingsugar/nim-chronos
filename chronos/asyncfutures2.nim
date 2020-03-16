@@ -31,7 +31,7 @@ type
     cancelcb*: CallbackFunc
     child*: FutureBase
     state*: FutureState
-    error*: ref Exception ## Stored exception
+    error*: ref CatchableError ## Stored exception
     errorStackTrace*: StackTrace
     stackTrace: StackTrace ## For debugging purposes only.
     id: int
@@ -169,7 +169,7 @@ proc checkFinished[T](future: Future[T], loc: ptr SrcLoc) =
   else:
     future.location[LocCompleteIndex] = loc
 
-proc call(callbacks: var Deque[AsyncCallback]) =
+proc call(callbacks: var Deque[AsyncCallback]) {.raises: [Defect].} =
   var count = len(callbacks)
   while count > 0:
     var item = callbacks.popFirst()
@@ -187,7 +187,7 @@ proc remove(callbacks: var Deque[AsyncCallback], item: AsyncCallback) =
     if p.function == item.function and p.udata == item.udata:
       p.deleted = true
 
-proc complete[T](future: Future[T], val: T, loc: ptr SrcLoc) =
+proc complete[T](future: Future[T], val: T, loc: ptr SrcLoc) {.raises: [Defect].} =
   if not(future.cancelled()):
     checkFinished(future, loc)
     doAssert(isNil(future.error))
@@ -199,12 +199,15 @@ template complete*[T](future: Future[T], val: T) =
   ## Completes ``future`` with value ``val``.
   complete(future, val, getSrcLocation())
 
-proc complete(future: Future[void], loc: ptr SrcLoc) =
-  if not(future.cancelled()):
-    checkFinished(future, loc)
-    doAssert(isNil(future.error))
-    future.state = FutureState.Finished
-    future.callbacks.call()
+proc complete(future: Future[void], loc: ptr SrcLoc) {.raises: [Defect].} =
+  try:
+    if not(future.cancelled()):
+      checkFinished(future, loc)
+      doAssert(isNil(future.error))
+      future.state = FutureState.Finished
+      future.callbacks.call()
+  except OSError:
+    discard # FIXME WIP
 
 template complete*(future: Future[void]) =
   ## Completes a void ``future``.
@@ -237,7 +240,7 @@ template complete*[T](futvar: FutureVar[T], val: T) =
   ## Any previously stored value will be overwritten.
   complete(futvar, val, getSrcLocation())
 
-proc fail[T](future: Future[T], error: ref Exception, loc: ptr SrcLoc) =
+proc fail[T](future: Future[T], error: ref CatchableError, loc: ptr SrcLoc) =
   if not(future.cancelled()):
     checkFinished(future, loc)
     future.state = FutureState.Failed
@@ -444,16 +447,23 @@ proc mget*[T](future: FutureVar[T]): var T =
   ## Future has not been finished.
   result = Future[T](future).value
 
-proc asyncCheck*[T](future: Future[T]) =
+proc asyncCheck*[T](future: Future[T]) {.raises: [Defect].} =
   ## Sets a callback on ``future`` which raises an exception if the future
   ## finished with an error.
   ##
   ## This should be used instead of ``discard`` to discard void futures.
   doAssert(not isNil(future), "Future is nil")
-  proc cb(data: pointer) =
-    if future.failed() or future.cancelled():
-      injectStacktrace(future)
-      raise future.error
+  proc cb(data: pointer) {.raises: [Defect].} =
+    try:
+      if future.failed() or future.cancelled():
+        injectStacktrace(future)
+        raise future.error
+    except CatchableError:
+      discard # FIXME WIP
+    except OSError:
+      discard # FIXME WIP
+    except ValueError:
+      discard # FIXME WIP
   future.callback = cb
 
 proc asyncDiscard*[T](future: Future[T]) = discard

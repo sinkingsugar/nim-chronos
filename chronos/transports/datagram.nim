@@ -32,7 +32,7 @@ type
     writer: Future[void]        # Writer vector completion Future
 
   DatagramCallback* = proc(transp: DatagramTransport,
-                           remote: TransportAddress): Future[void] {.gcsafe.}
+                           remote: TransportAddress): Future[void] {.gcsafe, raises: [Defect].}
 
   DatagramTransport* = ref object of RootRef
     fd*: AsyncFD                    # File descriptor
@@ -91,7 +91,7 @@ template setReadError(t, e: untyped) =
   (t).state.incl(ReadError)
   (t).error = getTransportOsError(e)
 
-proc setupDgramTransportTracker(): DgramTransportTracker {.gcsafe.}
+proc setupDgramTransportTracker(): DgramTransportTracker {.gcsafe, raises: [Defect].}
 
 proc getDgramTransportTracker(): DgramTransportTracker {.inline.} =
   result = cast[DgramTransportTracker](getTracker(DgramTransportTrackerName))
@@ -115,13 +115,16 @@ proc untrackDgram(t: DatagramTransport) {.inline.}  =
   var tracker = getDgramTransportTracker()
   inc(tracker.closed)
 
-proc setupDgramTransportTracker(): DgramTransportTracker {.gcsafe.} =
-  result = new DgramTransportTracker
-  result.opened = 0
-  result.closed = 0
-  result.dump = dumpTransportTracking
-  result.isLeaked = leakTransport
-  addTracker(DgramTransportTrackerName, result)
+proc setupDgramTransportTracker(): DgramTransportTracker {.gcsafe, raises: [Defect].} =
+  try:
+    result = new DgramTransportTracker
+    result.opened = 0
+    result.closed = 0
+    result.dump = dumpTransportTracking
+    result.isLeaked = leakTransport
+    addTracker(DgramTransportTrackerName, result)
+  except OSError:
+    discard # FIXME WIP
 
 when defined(windows):
 
@@ -135,68 +138,78 @@ when defined(windows):
     IPPROTO_IP = DWORD(0)
     IP_TTL = DWORD(4)
 
-  proc writeDatagramLoop(udata: pointer) =
+  proc writeDatagramLoop(udata: pointer) {.raises: [Defect].} =
     var bytesCount: int32
     var ovl = cast[PtrCustomOverlapped](udata)
     var transp = cast[DatagramTransport](ovl.data.udata)
     while len(transp.queue) > 0:
       if WritePending in transp.state:
-        ## Continuation
-        transp.state.excl(WritePending)
-        let err = transp.wovl.data.errCode
-        let vector = transp.queue.popFirst()
-        if err == OSErrorCode(-1):
-          if not(vector.writer.finished()):
-            vector.writer.complete()
-        elif int(err) == ERROR_OPERATION_ABORTED:
-          # CancelIO() interrupt
-          transp.state.incl(WritePaused)
-          if not(vector.writer.finished()):
-            vector.writer.complete()
-        else:
-          transp.state.incl({WritePaused, WriteError})
-          if not(vector.writer.finished()):
-            vector.writer.fail(getTransportOsError(err))
-      else:
-        ## Initiation
-        transp.state.incl(WritePending)
-        let fd = SocketHandle(ovl.data.fd)
-        var vector = transp.queue.popFirst()
-        transp.setWriterWSABuffer(vector)
-        var ret: cint
-        if vector.kind == WithAddress:
-          var fixedAddress = windowsAnyAddressFix(vector.address)
-          toSAddr(fixedAddress, transp.waddr, transp.walen)
-          ret = WSASendTo(fd, addr transp.wwsabuf, DWORD(1), addr bytesCount,
-                          DWORD(0), cast[ptr SockAddr](addr transp.waddr),
-                          cint(transp.walen),
-                          cast[POVERLAPPED](addr transp.wovl), nil)
-        else:
-          ret = WSASend(fd, addr transp.wwsabuf, DWORD(1), addr bytesCount,
-                        DWORD(0), cast[POVERLAPPED](addr transp.wovl), nil)
-        if ret != 0:
-          let err = osLastError()
-          if int(err) == ERROR_OPERATION_ABORTED:
+        try:
+          ## Continuation
+          transp.state.excl(WritePending)
+          let err = transp.wovl.data.errCode
+          let vector = transp.queue.popFirst()
+          if err == OSErrorCode(-1):
+            if not(vector.writer.finished()):
+              vector.writer.complete()
+          elif int(err) == ERROR_OPERATION_ABORTED:
             # CancelIO() interrupt
-            transp.state.excl(WritePending)
             transp.state.incl(WritePaused)
             if not(vector.writer.finished()):
               vector.writer.complete()
-          elif int(err) == ERROR_IO_PENDING:
-            transp.queue.addFirst(vector)
           else:
-            transp.state.excl(WritePending)
             transp.state.incl({WritePaused, WriteError})
             if not(vector.writer.finished()):
               vector.writer.fail(getTransportOsError(err))
-        else:
-          transp.queue.addFirst(vector)
-        break
+        except OSError:
+          discard # FIXME WIP
+        except TransportAddressError:
+          discard # FIXME WIP
+      else:
+        ## Initiation
+        try:
+          transp.state.incl(WritePending)
+          let fd = SocketHandle(ovl.data.fd)
+          var vector = transp.queue.popFirst()
+          transp.setWriterWSABuffer(vector)
+          var ret: cint
+          if vector.kind == WithAddress:
+            var fixedAddress = windowsAnyAddressFix(vector.address)
+            toSAddr(fixedAddress, transp.waddr, transp.walen)
+            ret = WSASendTo(fd, addr transp.wwsabuf, DWORD(1), addr bytesCount,
+                          DWORD(0), cast[ptr SockAddr](addr transp.waddr),
+                          cint(transp.walen),
+                          cast[POVERLAPPED](addr transp.wovl), nil)
+          else:
+            ret = WSASend(fd, addr transp.wwsabuf, DWORD(1), addr bytesCount,
+                        DWORD(0), cast[POVERLAPPED](addr transp.wovl), nil)
+          if ret != 0:
+            let err = osLastError()
+            if int(err) == ERROR_OPERATION_ABORTED:
+              # CancelIO() interrupt
+              transp.state.excl(WritePending)
+              transp.state.incl(WritePaused)
+              if not(vector.writer.finished()):
+                vector.writer.complete()
+            elif int(err) == ERROR_IO_PENDING:
+              transp.queue.addFirst(vector)
+            else:
+              transp.state.excl(WritePending)
+              transp.state.incl({WritePaused, WriteError})
+              if not(vector.writer.finished()):
+                vector.writer.fail(getTransportOsError(err))
+          else:
+            transp.queue.addFirst(vector)
+          break
+        except OSError:
+          discard # FIXME WIP
+        except TransportAddressError:
+          discard # FIXME WIP
 
     if len(transp.queue) == 0:
       transp.state.incl(WritePaused)
 
-  proc readDatagramLoop(udata: pointer) =
+  proc readDatagramLoop(udata: pointer) {.raises: [Defect].} =
     var
       bytesCount: int32
       raddr: TransportAddress
@@ -205,69 +218,75 @@ when defined(windows):
     while true:
       if ReadPending in transp.state:
         ## Continuation
-        transp.state.excl(ReadPending)
-        let err = transp.rovl.data.errCode
-        if err == OSErrorCode(-1):
-          let bytesCount = transp.rovl.data.bytesCount
-          if bytesCount == 0:
-            transp.state.incl({ReadEof, ReadPaused})
-          fromSAddr(addr transp.raddr, transp.ralen, raddr)
-          transp.buflen = bytesCount
-          asyncCheck transp.function(transp, raddr)
-        elif int(err) == ERROR_OPERATION_ABORTED:
-          # CancelIO() interrupt or closeSocket() call.
-          transp.state.incl(ReadPaused)
-          if ReadClosed in transp.state and not(transp.future.finished()):
-            # Stop tracking transport
-            untrackDgram(transp)
-            # If `ReadClosed` present, then close(transport) was called.
-            transp.future.complete()
-            GC_unref(transp)
-          break
-        else:
-          transp.setReadError(err)
-          transp.state.incl(ReadPaused)
-          transp.buflen = 0
-          asyncCheck transp.function(transp, raddr)
+        try:
+          transp.state.excl(ReadPending)
+          let err = transp.rovl.data.errCode
+          if err == OSErrorCode(-1):
+            let bytesCount = transp.rovl.data.bytesCount
+            if bytesCount == 0:
+              transp.state.incl({ReadEof, ReadPaused})
+              fromSAddr(addr transp.raddr, transp.ralen, raddr)
+              transp.buflen = bytesCount
+              asyncCheck transp.function(transp, raddr)
+            elif int(err) == ERROR_OPERATION_ABORTED:
+              # CancelIO() interrupt or closeSocket() call.
+              transp.state.incl(ReadPaused)
+              if ReadClosed in transp.state and not(transp.future.finished()):
+                # Stop tracking transport
+                untrackDgram(transp)
+                # If `ReadClosed` present, then close(transport) was called.
+                transp.future.complete()
+                GC_unref(transp)
+                break
+          else:
+            transp.setReadError(err)
+            transp.state.incl(ReadPaused)
+            transp.buflen = 0
+            asyncCheck transp.function(transp, raddr)
+        except OSError:
+          discard # FIXME WIP
       else:
         ## Initiation
-        if transp.state * {ReadEof, ReadClosed, ReadError} == {}:
-          transp.state.incl(ReadPending)
-          let fd = SocketHandle(ovl.data.fd)
-          transp.rflag = 0
-          transp.ralen = SockLen(sizeof(Sockaddr_storage))
-          let ret = WSARecvFrom(fd, addr transp.rwsabuf, DWORD(1),
+        try:
+          if transp.state * {ReadEof, ReadClosed, ReadError} == {}:
+            transp.state.incl(ReadPending)
+            let fd = SocketHandle(ovl.data.fd)
+            transp.rflag = 0
+            transp.ralen = SockLen(sizeof(Sockaddr_storage))
+            let ret = WSARecvFrom(fd, addr transp.rwsabuf, DWORD(1),
                                 addr bytesCount, addr transp.rflag,
                                 cast[ptr SockAddr](addr transp.raddr),
                                 cast[ptr cint](addr transp.ralen),
                                 cast[POVERLAPPED](addr transp.rovl), nil)
-          if ret != 0:
-            let err = osLastError()
-            if int(err) == ERROR_OPERATION_ABORTED:
-              # CancelIO() interrupt
-              transp.state.excl(ReadPending)
-              transp.state.incl(ReadPaused)
-            elif int(err) == WSAECONNRESET:
-              transp.state.excl(ReadPending)
-              transp.state.incl({ReadPaused, ReadEof})
-              break
-            elif int(err) == ERROR_IO_PENDING:
-              discard
-            else:
-              transp.state.excl(ReadPending)
-              transp.state.incl(ReadPaused)
-              transp.setReadError(err)
-              transp.buflen = 0
-              asyncCheck transp.function(transp, raddr)
-        else:
-          # Transport closure happens in callback, and we not started new
-          # WSARecvFrom session.
-          if ReadClosed in transp.state and not(transp.future.finished()):
-            # Stop tracking transport
-            untrackDgram(transp)
-            transp.future.complete()
-            GC_unref(transp)
-        break
+            if ret != 0:
+              let err = osLastError()
+              if int(err) == ERROR_OPERATION_ABORTED:
+                # CancelIO() interrupt
+                transp.state.excl(ReadPending)
+                transp.state.incl(ReadPaused)
+              elif int(err) == WSAECONNRESET:
+                transp.state.excl(ReadPending)
+                transp.state.incl({ReadPaused, ReadEof})
+                break
+              elif int(err) == ERROR_IO_PENDING:
+                discard
+              else:
+                transp.state.excl(ReadPending)
+                transp.state.incl(ReadPaused)
+                transp.setReadError(err)
+                transp.buflen = 0
+                asyncCheck transp.function(transp, raddr)
+          else:
+            # Transport closure happens in callback, and we not started new
+            # WSARecvFrom session.
+            if ReadClosed in transp.state and not(transp.future.finished()):
+              # Stop tracking transport
+              untrackDgram(transp)
+              transp.future.complete()
+              GC_unref(transp)
+          break
+        except OSError:
+          discard # FIXME WIP
 
   proc resumeRead(transp: DatagramTransport) {.inline.} =
     transp.state.excl(ReadPaused)
@@ -579,12 +598,15 @@ else:
 
 proc close*(transp: DatagramTransport) =
   ## Closes and frees resources of transport ``transp``.
-  proc continuation(udata: pointer) =
-    if not(transp.future.finished()):
-      # Stop tracking transport
-      untrackDgram(transp)
-      transp.future.complete()
-      GC_unref(transp)
+  proc continuation(udata: pointer) {.raises: [Defect].} =
+    try:
+      if not(transp.future.finished()):
+        # Stop tracking transport
+        untrackDgram(transp)
+        transp.future.complete()
+        GC_unref(transp)
+    except OSError:
+      discard # FIXME WIP
 
   when defined(windows):
     if {ReadClosed, WriteClosed} * transp.state == {}:
