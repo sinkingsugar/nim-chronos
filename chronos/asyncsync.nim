@@ -58,6 +58,19 @@ type
   AsyncLockError* = object of CatchableError
     ## ``AsyncLock`` is either locked or unlocked.
 
+when defined(TSAN):
+  proc tsanMutexCreate*(address: pointer, flags: cuint) {.importc: "__tsan_mutex_create".}
+  proc tsanMutexDestroy*(address: pointer, flags: cuint) {.importc: "__tsan_mutex_destroy".}
+  proc tsanMutexPreLock*(address: pointer, flags: cuint) {.importc: "__tsan_mutex_pre_lock".}
+  proc tsanMutexPostLock*(address: pointer, flags: cuint, recursion: cint) {.importc: "__tsan_mutex_post_lock".}
+  proc tsanMutexPreUnlock*(address: pointer, flags: cuint) {.importc: "__tsan_mutex_pre_unlock".}
+  proc tsanMutexPostUnlock*(address: pointer, flags: cuint) {.importc: "__tsan_mutex_post_unlock".}
+
+  const
+    TsanMutexLinkerInit* = 1 shl 0 # ignore destroy as we use gc... this is wrong thought
+    TsanMutexTryLock* = 1 shl 4
+    TsanMutexTryLockFailed* = 1 shl 5
+
 proc newAsyncLock*(): AsyncLock =
   ## Creates new asynchronous lock ``AsyncLock``.
   ##
@@ -72,7 +85,10 @@ proc newAsyncLock*(): AsyncLock =
   # Workaround for callSoon() not worked correctly before
   # getGlobalDispatcher() call.
   discard getGlobalDispatcher()
-  AsyncLock(waiters: newSeq[Future[void]](), locked: false, acquired: false)
+  var res = AsyncLock(waiters: newSeq[Future[void]](), locked: false, acquired: false)
+  when defined(TSAN):
+    tsanMutexCreate(addr res, TsanMutexLinkerInit)
+  res
 
 proc wakeUpFirst(lock: AsyncLock): bool {.inline.} =
   ## Wake up the first waiter if it isn't done.
@@ -101,15 +117,25 @@ proc acquire*(lock: AsyncLock) {.async.} =
   ##
   ## This procedure blocks until the lock ``lock`` is unlocked, then sets it
   ## to locked and returns.
+  when defined(TSAN):
+    tsanMutexPreLock(addr lock, TsanMutexTryLock)
+  
   if not(lock.locked) and lock.checkAll():
     lock.acquired = true
     lock.locked = true
   else:
+    when defined(TSAN):
+      tsanMutexPostLock(addr lock, TsanMutexTryLockFailed, 0)
     var w = newFuture[void]("AsyncLock.acquire")
     lock.waiters.add(w)
     await w
+    when defined(TSAN):
+      tsanMutexPreLock(addr lock, 0)
     lock.acquired = true
     lock.locked = true
+  
+  when defined(TSAN):
+    tsanMutexPostLock(addr lock, 0, 0)
 
 proc locked*(lock: AsyncLock): bool =
   ## Return `true` if the lock ``lock`` is acquired, `false` otherwise.
@@ -122,6 +148,8 @@ proc release*(lock: AsyncLock) =
   ## other coroutines are blocked waiting for the lock to become unlocked,
   ## allow exactly one of them to proceed.
   if lock.locked:
+    when defined(TSAN):
+      tsanMutexPreUnlock(addr lock, 0)
     # We set ``lock.locked`` to ``false`` only when there no active waiters.
     # If active waiters are present, then ``lock.locked`` will be set to `true`
     # in ``acquire()`` procedure's continuation.
@@ -131,6 +159,9 @@ proc release*(lock: AsyncLock) =
       lock.acquired = false
       if not(lock.wakeUpFirst()):
         lock.locked = false
+    
+    when defined(TSAN):
+      tsanMutexPostUnlock(addr lock, 0)
   else:
     raise newException(AsyncLockError, "AsyncLock is not acquired!")
 
